@@ -679,6 +679,23 @@ class ModelRunner:
             os.makedirs(self.profiler_dir, exist_ok=True)
 
         self._setup_device_and_distributed(rank, config)
+        if config.moe_ep_flatten_tp_across_dp and torch.version.hip:
+            # CU-masked auxiliary streams have hipStreamDefault semantics.
+            # A legacy null main stream would implicitly wait for them (and
+            # vice versa), defeating the explicit dependency edges used for
+            # previous-token output and shared-expert overlap. Keep model
+            # initialization, graph capture and forwards on one nonblocking
+            # main stream; carry over any distributed-init work explicitly.
+            previous_stream = torch.cuda.current_stream(self.device)
+            self._model_compute_stream = torch.cuda.Stream(device=self.device)
+            self._model_compute_stream.wait_stream(previous_stream)
+            torch.cuda.set_stream(self._model_compute_stream)
+            logger.info(
+                "Native wide EP uses a nonblocking model compute stream "
+                "(previous=%s, current=%s)",
+                previous_stream.cuda_stream,
+                self._model_compute_stream.cuda_stream,
+            )
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
