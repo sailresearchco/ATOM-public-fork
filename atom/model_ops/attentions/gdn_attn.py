@@ -1191,7 +1191,10 @@ class GDNStateMixin(PoolRowsMixin):
                 else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
             )
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(non_spec_query_start_loc)
+                compute_causal_conv1d_metadata(
+                    non_spec_query_start_loc,
+                    seqlens_cpu=batch.num_scheduled_tokens[:num_prefills],
+                )
             )
         else:
             has_initial_state = None
@@ -1585,9 +1588,22 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 PAD_SLOT_ID = -1
 
 
-def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
+def compute_causal_conv1d_metadata(
+    query_start_loc_p: torch.Tensor, *, seqlens_cpu=None
+):
     # Needed for causal_conv1d
-    seqlens = query_start_loc_p.diff().to("cpu")
+    if seqlens_cpu is None:
+        # Compatibility for plugin callers without scheduler-owned lengths.
+        seqlens = query_start_loc_p.diff().to("cpu")
+    else:
+        if isinstance(seqlens_cpu, torch.Tensor):
+            assert seqlens_cpu.device.type == "cpu"
+        # Native scheduling already owns these exact per-request lengths.
+        # Reading them back from GPU can deadlock overlapping DP/EP forwards.
+        seqlens = torch.as_tensor(
+            seqlens_cpu, dtype=query_start_loc_p.dtype, device="cpu"
+        )
+        assert seqlens.numel() == query_start_loc_p.numel() - 1
     nums_dict = {}  # type: ignore
     batch_ptr = None
     token_chunk_offset_ptr = None
@@ -1597,7 +1613,9 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
         nums_dict[BLOCK_M] = {}
         nums_dict[BLOCK_M]["nums"] = nums
         nums_dict[BLOCK_M]["tot"] = nums.sum().item()
-        mlist = torch.from_numpy(np.repeat(np.arange(len(nums)), nums))
+        mlist = torch.from_numpy(
+            np.repeat(np.arange(len(nums), dtype=np.int32), nums)
+        )
         nums_dict[BLOCK_M]["mlist"] = mlist
         mlist_len = len(nums_dict[BLOCK_M]["mlist"])
         nums_dict[BLOCK_M]["mlist_len"] = mlist_len
@@ -1605,7 +1623,11 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
         offsetlist = []  # type: ignore
         for idx, num in enumerate(nums):
             offsetlist.extend(range(num))
-        offsetlist = torch.tensor(offsetlist, dtype=torch.int32)
+        offsetlist = torch.tensor(offsetlist, dtype=torch.int32, device="cpu")
+        if device.type == "cuda":
+            mlist = mlist.pin_memory()
+            offsetlist = offsetlist.pin_memory()
+        nums_dict[BLOCK_M]["mlist"] = mlist
         nums_dict[BLOCK_M]["offsetlist"] = offsetlist
 
         if batch_ptr is None:
@@ -1623,8 +1645,8 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
                     PAD_SLOT_ID
                 )
 
-        batch_ptr[0:mlist_len].copy_(mlist)
-        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist)  # type: ignore
+        batch_ptr[0:mlist_len].copy_(mlist, non_blocking=True)
+        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist, non_blocking=True)  # type: ignore
         nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr  # type: ignore
 
