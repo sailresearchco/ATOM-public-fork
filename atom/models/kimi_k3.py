@@ -1157,6 +1157,7 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
+        chunk_indices_by_size: dict[int, torch.Tensor] | None = None,
     ):
         from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
@@ -1182,6 +1183,8 @@ class KimiKDAAttention(nn.Module):
             safe_gate=self._kda_gate_lower_bound is not None,
             lower_bound=self._kda_gate_lower_bound,
             cu_seqlens=cu_seqlens,
+            **({"chunk_indices_by_size": chunk_indices_by_size}
+               if chunk_indices_by_size is not None else {}),
             # V-first state, matching the layout mamba_v_cache holds and the
             # fused decode kernel writes. Without it the state comes back
             # K-first and decode reads it transposed.
@@ -1322,6 +1325,7 @@ class KimiKDAAttention(nn.Module):
                 initial,
                 query_start_loc,
                 True,
+                getattr(kda_metadata, "kda_chunk_indices_by_size", None),
             )
             # last_state already has ssm_state's dtype (fla preserves the
             # initial_state dtype; the gathered initial is allocated as such),

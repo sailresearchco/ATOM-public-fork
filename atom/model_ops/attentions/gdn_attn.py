@@ -119,6 +119,8 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+    # Optional precomputed KDA indices, keyed by AITER's selected chunk size.
+    kda_chunk_indices_by_size: dict[int, torch.Tensor] | None = None
 
 
 class GDNStateMixin(PoolRowsMixin):

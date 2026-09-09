@@ -397,6 +397,14 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             is_prefill=True,
             prepare_block_tables=False,
         )
+        from atom.model_ops.kimi_k3.prefill_metadata import prepare_kda_chunk_indices
+
+        metadata = attn_metadata.gdn_metadata
+        metadata.kda_chunk_indices_by_size = prepare_kda_chunk_indices(
+            batch.num_scheduled_tokens[: metadata.num_prefills],
+            device=metadata.non_spec_query_start_loc.device,
+            dtype=metadata.non_spec_query_start_loc.dtype,
+        )
         return attn_metadata, positions
 
     def prepare_decode(
