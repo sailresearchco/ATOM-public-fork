@@ -116,6 +116,17 @@ def aligned_index_cache_dim(hf_config) -> int:
     return ((index_dim + 15) // 16) * 16
 
 
+def _initialize_prefill_kv_indptr(
+    kv_indptr: torch.Tensor, context_lens: torch.Tensor, bs: int
+) -> None:
+    """Build scheduled requests' KV offsets without a host/device barrier."""
+    # Scalar indexing assignment stages a host scalar and synchronizes HIP.
+    # DP peers may need this rank to enqueue its next EP collective first.
+    kv_indptr[:1].zero_()
+    # context_lens can have a padded tail beyond the scheduled requests.
+    kv_indptr[1 : bs + 1] = torch.cumsum(context_lens[:bs], 0)
+
+
 def _pad_prefill_mla_draft_tail(
     kv_indptr: torch.Tensor,
     kv_last_page_lens: np.ndarray,
@@ -1614,10 +1625,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.kv_indices = var["kv_indices"].gpu
             kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
             attn_metadata.kv_indptr = kv_indptr[: bs + 1]
-            attn_metadata.kv_indptr[0] = 0
-            # `context_lens` is padded past the requests this indptr counts.
-            attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
-                attn_metadata.context_lens[:bs], 0
+            _initialize_prefill_kv_indptr(
+                attn_metadata.kv_indptr, attn_metadata.context_lens, bs
             )
 
             # kv_indices_generate_triton expects logical block_tables (one
