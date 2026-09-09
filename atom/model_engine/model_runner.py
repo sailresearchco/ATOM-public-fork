@@ -202,7 +202,15 @@ class tokenIDProcessor:
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
 
-        self.async_copy_stream = torch.cuda.Stream(runner.device)
+        if runner.config.moe_ep_flatten_tp_across_dp and torch.version.hip:
+            # Previous-token output must not queue behind the next forward's
+            # cross-node collectives. ROCclr can alias ordinary HIP streams
+            # onto one HSA ring; use an independent full-CU queue for D2H.
+            from atom.utils.hip_stream import create_full_device_hip_stream
+
+            self.async_copy_stream = create_full_device_hip_stream()
+        else:
+            self.async_copy_stream = torch.cuda.Stream(runner.device)
         self.default_num_rejected_tokens = torch.zeros(
             max_num_batched_tokens, dtype=torch.int32, device=device
         )
