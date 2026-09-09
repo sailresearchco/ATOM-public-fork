@@ -31,12 +31,41 @@ def test_mixed_prefill_arena_uses_global_maximum(monkeypatch):
     forward = SimpleNamespace(context=context, dp_metadata=SimpleNamespace(max_tokens_across_dp=101))
     monkeypatch.setattr(mk, 'get_forward_context', lambda: forward)
     monkeypatch.setattr(mk, 'get_dp_group', lambda: SimpleNamespace(world_size=2))
+    monkeypatch.setattr(mk, 'get_current_atom_config', lambda: SimpleNamespace(moe_ep_flatten_tp_across_dp=False))
     kernel = SimpleNamespace(prepare_finalize=SimpleNamespace(num_dispatchers=lambda:16))
     arena = torch.zeros(4096, 4)
     ids = torch.zeros(4096, 16, dtype=torch.int32)
     actual = mk.FusedMoEModularKernel._maybe_trim_dispatch_output(
         kernel, arena, None, ids, ids.float(), torch.zeros(1,16,dtype=torch.int32), None)
     assert actual[0].shape[0] == 101 * 16
+
+
+@pytest.mark.parametrize('counts', [[1, 101], [1, 7, 8192, 7936], [0, 1, 9, 17]])
+def test_mixed_native_receive_bound_covers_all_padded_senders(monkeypatch, counts):
+    from atom.model_ops.fused_moe import modular_kernel as mk
+    tp, dp = 8, len(counts)
+    forward = SimpleNamespace(
+        context=SimpleNamespace(running_tokens=1, running_tokens_are_unified=False, is_prefill=True),
+        dp_metadata=SimpleNamespace(max_tokens_across_dp=max(counts)),
+    )
+    monkeypatch.setattr(mk, 'get_forward_context', lambda: forward)
+    monkeypatch.setattr(mk, 'get_dp_group', lambda: SimpleNamespace(world_size=dp))
+    monkeypatch.setattr(mk, 'get_tp_group', lambda: SimpleNamespace(world_size=tp))
+    monkeypatch.setattr(mk, 'get_current_atom_config', lambda: SimpleNamespace(moe_ep_flatten_tp_across_dp=True))
+    kernel = SimpleNamespace(prepare_finalize=SimpleNamespace(num_dispatchers=lambda:dp*tp))
+    arena = torch.zeros(131072, 1)
+    ids = torch.zeros(131072, 16, dtype=torch.int32)
+    maximum_possible_receive = sum(((n + tp - 1) // tp) * tp for n in counts)
+    sizes = []
+    for count in counts:
+        sender_rows = (count + tp - 1) // tp
+        actual = mk.FusedMoEModularKernel._maybe_trim_dispatch_output(
+            kernel, arena, None, ids, ids, torch.zeros(sender_rows, 16, dtype=torch.int32), None)
+        sizes.append(actual[0].shape[0])
+        assert actual[0].shape[0] >= maximum_possible_receive
+    assert len(set(sizes)) == 1
+    if max(counts) == 8192:
+        assert sizes[0] == 32768  # The OOM case must not feed the 131072-row arena.
 
 
 def test_situ_missing_aiter_fusion_uses_existing_activation(monkeypatch):

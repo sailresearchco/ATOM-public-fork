@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 
 from dataclasses import dataclass
+from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
 from atom.utils.tbo.ubatching import tbo_overlap_enabled
@@ -10,7 +11,7 @@ from typing import Callable, Optional, final
 from enum import Enum
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
-from aiter.dist.parallel_state import get_dp_group
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 
 class FusedMoEActivationFormat(Enum):
@@ -350,11 +351,16 @@ class FusedMoEModularKernel(torch.nn.Module):
         can_trim = tokens_unified
         dp_metadata = getattr(forward_context, "dp_metadata", None)
         if not tokens_unified and dp_metadata is not None:
-            # Mixed/prefill batches have unequal sender sizes, but the shared
-            # CPU metadata already gives a safe maximum without a GPU sync.
-            # This conservative bound also covers unsliced TP senders and TBO.
+            # DP metadata describes the token axis before native TP slicing.
+            # Each sender owns ceil(tokens / TP) rows, including padding. Using
+            # the unsliced count here inflated long-prefill expert temporaries
+            # by TP and exhausted memory despite a much smaller live receive.
+            max_sender_tokens = dp_metadata.max_tokens_across_dp
+            if get_current_atom_config().moe_ep_flatten_tp_across_dp:
+                tp_size = get_tp_group().world_size
+                max_sender_tokens = (max_sender_tokens + tp_size - 1) // tp_size
             total_valid_tokens = max(
-                dp_metadata.max_tokens_across_dp, topk_ids.shape[0]
+                max_sender_tokens, topk_ids.shape[0]
             ) * self.prepare_finalize.num_dispatchers()
             can_trim = True
         if total_valid_tokens < dispatch_a1.shape[0] and can_trim:
