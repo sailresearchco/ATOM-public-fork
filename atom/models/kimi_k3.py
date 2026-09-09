@@ -1717,7 +1717,15 @@ class KimiLinearModel(nn.Module):
         # used when the model has shared experts.
         self.alt_stream = None
         if getattr(config, "num_shared_experts", 0):
-            self.alt_stream = torch.cuda.Stream()
+            if atom_config.moe_ep_flatten_tp_across_dp and torch.version.hip:
+                # Keep shared-expert event waits off the main stream's HSA
+                # ring. An all-CU mask reserves a queue, not compute capacity.
+                # Same ROCclr queue-isolation mechanism as ATOM PR #2039.
+                from atom.utils.hip_stream import create_full_device_hip_stream
+
+                self.alt_stream = create_full_device_hip_stream()
+            else:
+                self.alt_stream = torch.cuda.Stream()
         _alt_stream = self.alt_stream
 
         self.start_layer, self.end_layer, self.layers = make_layers(
