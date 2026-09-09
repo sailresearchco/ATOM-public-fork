@@ -15,6 +15,7 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
+    get_tp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -190,7 +191,13 @@ class SituAndMul(nn.Module):
         # Fuse per-token FP8 quant into the activation only when the consuming
         # down_proj runs a8w8 per-token FP8 AND linear_beta is set (the aiter
         # kernel always applies the linear-beta tanh to the up half).
-        self.fused_quant = fused_quant and linear_beta is not None
+        from aiter.ops import activation as aiter_activation
+
+        self.fused_quant = (
+            fused_quant
+            and linear_beta is not None
+            and hasattr(aiter_activation, "situv2_and_mul_quant")
+        )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         from atom.model_ops.kimi_k3 import situ_and_mul_maybe_quant
@@ -493,6 +500,27 @@ class KimiSparseMoeBlock(nn.Module):
             return summed, None
         return self.split_moe_forward(hidden_states)
 
+    def _routed_moe(self, routed_input, router_logits):
+        # Each TP group has replicated tokens after attention. Give each EP
+        # sender a distinct token slice, then reconstruct the full token axis
+        # for the following TP attention layer. MoRI already sums experts.
+        pc = self.experts.moe_parallel_config
+        if not (get_current_atom_config().moe_ep_flatten_tp_across_dp
+                and pc.use_all2all_kernels and self.tp_size > 1):
+            return self.experts(routed_input, router_logits)
+        tokens = routed_input.shape[0]
+        per_rank = (tokens + self.tp_size - 1) // self.tp_size
+        pad = per_rank * self.tp_size - tokens
+        x = torch.nn.functional.pad(routed_input, (0, 0, 0, pad))
+        logits = torch.nn.functional.pad(router_logits, (0, 0, 0, pad))
+        rank = get_tensor_model_parallel_rank()
+        start = rank * per_rank
+        result = self.experts(
+            x[start:start + per_rank].contiguous(),
+            logits[start:start + per_rank].contiguous(),
+        )
+        return get_tp_group().all_gather(result, dim=0)[:tokens]
+
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Routed-expert path only. For the latent MoE this includes the routed
         all-reduce (required before the nonlinear routed_expert_norm); the shared
@@ -503,14 +531,14 @@ class KimiSparseMoeBlock(nn.Module):
             if self.use_latent_moe
             else hidden_states
         )
-        routed_output = self.experts(routed_input, router_logits)
+        routed_output = self._routed_moe(routed_input, router_logits)
         if self.use_latent_moe:
             # self.experts runs with reduce_results=False, so routed_output is a
             # TP-partial sum over the sharded expert intermediate. routed_expert_norm
             # is a (nonlinear) RMSNorm, so it must operate on the FULL sum:
             # sum_r norm(partial_r) != norm(sum_r partial_r). All-reduce here first;
             # routed_expert_norm/up_proj are replicated, so the result stays full.
-            if self.tp_size > 1:
+            if self.tp_size > 1 and not self.experts.moe_parallel_config.use_all2all_kernels:
                 routed_output = tensor_model_parallel_all_reduce(routed_output)
             if self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
@@ -625,7 +653,7 @@ class KimiSparseMoeBlock(nn.Module):
         if self.use_latent_moe:
             router_logits = self.gate(hidden_states)
             routed_input = self.routed_expert_down_proj(hidden_states)
-            routed_output = self.experts(routed_input, router_logits)
+            routed_output = self._routed_moe(routed_input, router_logits)
         else:
             routed_output = self.routed_expert_forward(hidden_states)
 
@@ -637,7 +665,8 @@ class KimiSparseMoeBlock(nn.Module):
         if self.use_latent_moe:
             if self.tp_size > 1:
                 current.wait_stream(alt)
-                routed_output = tensor_model_parallel_all_reduce(routed_output)
+                if not self.experts.moe_parallel_config.use_all2all_kernels:
+                    routed_output = tensor_model_parallel_all_reduce(routed_output)
 
             if self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)

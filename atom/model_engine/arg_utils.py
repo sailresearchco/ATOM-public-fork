@@ -74,6 +74,7 @@ class EngineArgs:
     fake_eplb: bool = False
     torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
+    moe_ep_flatten_tp_across_dp: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
     enable_tbo: str | None = None
     all2all_backend: str | None = None
@@ -295,6 +296,11 @@ class EngineArgs:
             help="Enable DP attention.",
         )
         parser.add_argument(
+            "--moe-ep-flatten-tp-across-dp",
+            action="store_true",
+            help="Keep native TP attention groups and shard experts across DP x TP.",
+        )
+        parser.add_argument(
             "--dp-load-balance",
             type=str,
             default=DP_LB_DEFAULT,
@@ -439,8 +445,8 @@ class EngineArgs:
                 "Let a hit that was refused for want of a checkpoint place a "
                 "rung of its own. --no-state-checkpoint-demand leaves the "
                 "prompt-end anchor as the only placement. On measured traces a "
-                "demand is 47% of all checkpoint writes but reads back 2.8% of "
-                "the time, against 85.2% for an anchor, so the rung's write "
+                "demand is 47%% of all checkpoint writes but reads back 2.8%% of "
+                "the time, against 85.2%% for an anchor, so the rung's write "
                 "traffic may cost more in evictions than its reuse is worth."
             ),
         )
@@ -668,6 +674,14 @@ class EngineArgs:
         Most fields are directly passed through with the same name.
         Only handles special cases that need transformation.
         """
+        if self.moe_ep_flatten_tp_across_dp:
+            if not self.enable_expert_parallel or self.enable_dp_attention:
+                raise ValueError(
+                    "Native DP x TP EP requires --enable-expert-parallel and "
+                    "must not collapse TP with --enable-dp-attention."
+                )
+            if self.all2all_backend not in ("high-throughput", "low-latency"):
+                raise ValueError("Native DP x TP EP requires an explicit MoRI backend.")
         kwargs = {
             f.name: getattr(self, f.name) for f in fields(self) if f.name != "model"
         }

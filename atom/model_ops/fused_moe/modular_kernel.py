@@ -328,17 +328,36 @@ class FusedMoEModularKernel(torch.nn.Module):
         exact received-token trim for DP+EP mixed batches and overrides this
         method via a plugin patch -- keep this body frontend-agnostic.
         """
-        context = get_forward_context().context
+        forward_context = get_forward_context()
+        context = forward_context.context
         if context is None:
             return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 
         dp_size = get_dp_group().world_size
         # running_tokens keeps the trimmed shape consistent capture-to-replay.
         total_valid_tokens = context.running_tokens * dp_size
+        # Native TP-preserving EP partitions and pads tokens before dispatch.
+        # Even an original one-token batch sends one row from every TP rank.
+        # Include those padding rows: MoRI's live receive count includes them,
+        # and trimming below that count lets the expert kernel read past M.
+        total_valid_tokens = max(
+            total_valid_tokens,
+            topk_ids.shape[0] * self.prepare_finalize.num_dispatchers(),
+        )
         tokens_unified = getattr(
             context, "running_tokens_are_unified", not context.is_prefill
         )
-        if total_valid_tokens < dispatch_a1.shape[0] and tokens_unified:
+        can_trim = tokens_unified
+        dp_metadata = getattr(forward_context, "dp_metadata", None)
+        if not tokens_unified and dp_metadata is not None:
+            # Mixed/prefill batches have unequal sender sizes, but the shared
+            # CPU metadata already gives a safe maximum without a GPU sync.
+            # This conservative bound also covers unsliced TP senders and TBO.
+            total_valid_tokens = max(
+                dp_metadata.max_tokens_across_dp, topk_ids.shape[0]
+            ) * self.prepare_finalize.num_dispatchers()
+            can_trim = True
+        if total_valid_tokens < dispatch_a1.shape[0] and can_trim:
             dispatch_a1 = dispatch_a1[:total_valid_tokens]
             dispatch_ids = dispatch_ids[:total_valid_tokens]
             dispatch_weights = dispatch_weights[:total_valid_tokens]
