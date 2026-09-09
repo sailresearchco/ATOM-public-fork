@@ -3,6 +3,19 @@
 import torch
 
 
+def prepare_kda_seq_bounds(seqlens_cpu):
+    """CPU sequence bounds for FlashKDA's segmentation decision."""
+    if isinstance(seqlens_cpu, torch.Tensor):
+        assert seqlens_cpu.device.type == "cpu"
+    bounds, offset = [], 0
+    for length in seqlens_cpu:
+        length = int(length)
+        assert length >= 0
+        bounds.append((offset, offset + length))
+        offset += length
+    return tuple(bounds)
+
+
 def prepare_kda_chunk_indices(seqlens_cpu, *, device, dtype=torch.int32):
     """Keep both AITER chunk sizes ready without reading GPU offsets back.
 

@@ -397,11 +397,15 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             is_prefill=True,
             prepare_block_tables=False,
         )
-        from atom.model_ops.kimi_k3.prefill_metadata import prepare_kda_chunk_indices
+        from atom.model_ops.kimi_k3.prefill_metadata import (
+            prepare_kda_chunk_indices, prepare_kda_seq_bounds,
+        )
 
         metadata = attn_metadata.gdn_metadata
+        lengths = batch.num_scheduled_tokens[: metadata.num_prefills]
+        metadata.kda_seq_bounds_cpu = prepare_kda_seq_bounds(lengths)
         metadata.kda_chunk_indices_by_size = prepare_kda_chunk_indices(
-            batch.num_scheduled_tokens[: metadata.num_prefills],
+            lengths,
             device=metadata.non_spec_query_start_loc.device,
             dtype=metadata.non_spec_query_start_loc.dtype,
         )
