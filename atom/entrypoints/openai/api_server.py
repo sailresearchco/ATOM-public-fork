@@ -357,7 +357,11 @@ _ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 _ANTHROPIC_PING_INTERVAL_SECONDS = 5.0
 _metrics_exporter = AtomMetricsExporter()
 _metrics_refresh_task: asyncio.Task | None = None
-_METRICS_REFRESH_INTERVAL_SECONDS = 5.0
+_METRICS_REFRESH_INTERVAL_SECONDS = float(
+    os.environ.get("ATOM_METRICS_INTERVAL_S", "5.0")
+)
+if not 0.1 <= _METRICS_REFRESH_INTERVAL_SECONDS <= 60.0:
+    raise ValueError("ATOM_METRICS_INTERVAL_S must be between 0.1 and 60 seconds")
 
 
 def _get_dp_session_affinity_ids(

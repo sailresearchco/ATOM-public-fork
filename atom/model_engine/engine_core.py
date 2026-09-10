@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -47,7 +48,9 @@ logger = logging.getLogger("atom")
 # How often each EngineCore publishes its metrics snapshot. Kept at the API
 # server's scrape interval: the exporter reads a cache, so this bounds how
 # stale a Prometheus sample can be.
-METRICS_PUSH_INTERVAL_S = 5.0
+METRICS_PUSH_INTERVAL_S = float(os.environ.get("ATOM_METRICS_INTERVAL_S", "5.0"))
+if not 0.1 <= METRICS_PUSH_INTERVAL_S <= 60.0:
+    raise ValueError("ATOM_METRICS_INTERVAL_S must be between 0.1 and 60 seconds")
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
