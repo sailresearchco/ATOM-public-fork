@@ -44,8 +44,8 @@ class EngineStats:
           throughput: 0.3 tokens/s, Running: 6 reqs, Waiting: 0 reqs, GPU KV
           cache usage: 0.0%, Prefix cache hit rate: 0.0%
 
-    A disabled section's ``update_*`` / ``maybe_log_*`` entry points are
-    no-ops, so callers need not guard on the feature flag.
+    Disabled sections do not log. Throughput lifetime token accounting stays
+    active even when its logging section is disabled.
     """
 
     __slots__ = (
@@ -74,6 +74,8 @@ class EngineStats:
         "label",
         "mtp_k",
         "num_generation_tokens",
+        "lifetime_generation_tokens",
+        "lifetime_prompt_tokens",
         "num_prompt_tokens",
         "spec_enabled",
         "throughput_enabled",
@@ -199,6 +201,8 @@ class EngineStats:
         self._throughput_last_log_time = time.monotonic()
         self.num_prompt_tokens = 0
         self.num_generation_tokens = 0
+        self.lifetime_generation_tokens = 0
+        self.lifetime_prompt_tokens = 0
 
     # ══ spec section ═════════════════════════════════════════════════════
 
@@ -713,6 +717,11 @@ class EngineStats:
     def update_throughput(
         self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
     ) -> None:
+        # Lifetime accounting survives log-window resets and disabled logging.
+        # Generation tokens are committed in postprocess; prompt tokens are
+        # uncached tokens submitted by scheduling, not completed-request totals.
+        self.lifetime_prompt_tokens += num_prompt_tokens
+        self.lifetime_generation_tokens += num_generation_tokens
         if not self.throughput_enabled:
             return
         self.num_prompt_tokens += num_prompt_tokens

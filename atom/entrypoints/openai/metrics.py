@@ -103,6 +103,16 @@ class _AtomMetricsCollector:
                 "Fraction of KV-cache blocks currently allocated.",
                 snapshot.get("kv_cache_usage_ratio", 0),
             ),
+            (
+                "atom:engine_snapshot_ranks",
+                "Number of enabled engine rank snapshots in the aggregate.",
+                snapshot.get("engine_snapshot_ranks", 0),
+            ),
+            (
+                "atom:engine_snapshot_oldest_timestamp_seconds",
+                "Oldest contributing engine snapshot's Unix timestamp.",
+                snapshot.get("engine_snapshot_oldest_timestamp_seconds", 0),
+            ),
         )
         for name, documentation, value in gauges:
             metric = GaugeMetricFamily(name, documentation)
@@ -124,6 +134,16 @@ class _AtomMetricsCollector:
                 "atom:generation_tokens",
                 "Number of generated tokens in completed requests.",
                 snapshot.get("generation_tokens", 0),
+            ),
+            (
+                "atom:engine_output_tokens_committed",
+                "Lifetime retained output tokens committed by engine steps, including unfinished requests.",
+                snapshot.get("engine_output_tokens_committed", 0),
+            ),
+            (
+                "atom:engine_prefill_tokens_scheduled",
+                "Lifetime uncached prefill tokens scheduled, including unfinished requests and recomputation.",
+                snapshot.get("engine_prefill_tokens_scheduled", 0),
             ),
             (
                 "atom:preemptions",

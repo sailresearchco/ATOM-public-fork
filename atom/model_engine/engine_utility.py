@@ -3,6 +3,7 @@
 
 import logging
 import queue
+import time
 from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
@@ -390,6 +391,13 @@ class EngineUtilityHandler:
                 "generation_tokens": int(
                     getattr(self.scheduler, "total_generation_tokens", 0)
                 ),
+                "engine_output_tokens_committed": int(
+                    engine_stats.lifetime_generation_tokens
+                ),
+                "engine_prefill_tokens_scheduled": int(
+                    engine_stats.lifetime_prompt_tokens
+                ),
+                "engine_snapshot_timestamp_seconds": time.time(),
                 "preemptions": int(getattr(self.scheduler, "total_preemptions", 0)),
                 "mtp": mtp,
                 "cache": cache,

@@ -681,7 +681,7 @@ class Scheduler:
         `engine_stats` and emit the periodic engine-status log line once
         `throughput_log_interval_s` has elapsed.
 
-        No-op when `--no-enable-log-stats` disabled the section.
+        Token accounting remains active when `--no-enable-log-stats` disables logging.
 
         The token counts must be accumulated on every call — they are what the
         line reports — but the three arguments below it are read fresh and then
@@ -691,9 +691,9 @@ class Scheduler:
         update.
         """
         stats = self.engine_stats
+        stats.update_throughput(num_prompt_tokens, num_generation_tokens)
         if not stats.throughput_enabled:
             return
-        stats.update_throughput(num_prompt_tokens, num_generation_tokens)
         if not stats.window_expired(time.monotonic()):
             return
         num_running_reqs, num_waiting_reqs = self.get_request_counts()
@@ -3451,9 +3451,9 @@ class PrefillScheduler:
         for the same reason.
         """
         stats = self.engine_stats
+        stats.update_throughput(num_prompt_tokens, num_generation_tokens)
         if not stats.throughput_enabled:
             return
-        stats.update_throughput(num_prompt_tokens, num_generation_tokens)
         if not stats.window_expired(time.monotonic()):
             return
         num_running_reqs, num_waiting_reqs = self.get_request_counts()

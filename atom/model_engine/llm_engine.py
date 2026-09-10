@@ -585,6 +585,13 @@ class LLMEngine:
             "requests_finished": summed("requests_finished"),
             "prompt_tokens": summed("prompt_tokens"),
             "generation_tokens": summed("generation_tokens"),
+            "engine_output_tokens_committed": summed("engine_output_tokens_committed"),
+            "engine_prefill_tokens_scheduled": summed("engine_prefill_tokens_scheduled"),
+            "engine_snapshot_ranks": len(rank_stats),
+            "engine_snapshot_oldest_timestamp_seconds": min(
+                (s.get("engine_snapshot_timestamp_seconds", 0) for s in rank_stats),
+                default=0,
+            ),
             "preemptions": summed("preemptions"),
             "kv_blocks_used": kv_used,
             "kv_blocks_free": summed("kv_blocks_free"),
