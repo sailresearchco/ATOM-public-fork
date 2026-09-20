@@ -1,19 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prepare/Finalize using mori dispatch_combine_v2 (FlyDSL/cco, gfx1250 wave32).
+"""Prepare/Finalize using MorI EPv2 over CCO (HIP internode or local FlyDSL/HIP).
 
-The production mori v1 (``mori.ops.EpDispatchCombineOp``) is authored for
-gfx942/950 HIP kernels and does not run on gfx1250. dispatch_combine_v2 is the
-gfx1250-capable cco/FlyDSL implementation. This module wires it into ATOM's
-FusedMoEModularKernel as a drop-in replacement for MoriPrepareAndFinalize,
-gated by ``ATOM_MORI_V2=1``.
-
-Pipeline of the gather transport (mirrors the validated standalone
-test_moe_layer_ep.py):
-    recv_x, recv_w, _, recv_idx, total_recv, routing = op.dispatch(
-        a1, topk_weights, None, topk_ids, return_routing=True)
-    dispatch_a1 = recv_x[:total_recv].clone()   # out of the cco VMM window
-    fused_out = aiter.fused_moe(dispatch_a1, ...)   # driven by the modular kernel
-    out, _ = op.combine(fused_out, routing=routing)
+Set ``ATOM_MORI_V2=1`` to select this adapter. Multi-node EP uses MorI's HIP
+internode kernels, with the physical local EP size passed explicitly. Local EP
+can use HIP or FlyDSL. The non-fused path preserves the native modular kernel's
+TP sender-padding and mixed-DPA receive bounds without reading a GPU counter
+on the host, so dispatch/expert/combine remains graph-capturable.
 
 Two transports sit behind the same prepare/finalize pair:
 
@@ -42,11 +34,13 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from aiter import ActivationType, QuantType
-from aiter.dist.parallel_state import get_dp_group
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
+from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.model_ops.fused_moe.mori_v2_config import MoriV2TransportConfig
 from atom.utils.forward_context import get_forward_context
 
 try:
@@ -331,22 +325,12 @@ def init_mori_v2_op(
     max_num_inp_token_per_rank: int,
     num_local_experts: int,
     num_experts_per_token: int,
-    data_type_itemsize: int,
+    data_type: torch.dtype,
+    transport: MoriV2TransportConfig,
     combine_mode: str = "gather",
 ) -> Any:
     """Create (and cache) a dispatch_combine_v2 op bound to the EP cco comm."""
     _import_v2()
-
-    data_type = torch.bfloat16
-    for dt in (torch.float8_e4m3fnuz, torch.float8_e4m3fn, torch.bfloat16):
-        if dt.itemsize == data_type_itemsize:
-            data_type = dt
-            break
-
-    per_rank_vmm = _cco_per_rank_vmm(
-        ep_size, hidden_dim, max_num_inp_token_per_rank, data_type.itemsize
-    )
-    comm = _init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm)
 
     cfg = EpDispatchCombineConfig(
         rank=ep_rank,
@@ -357,12 +341,26 @@ def init_mori_v2_op(
         num_experts_per_token=num_experts_per_token,
         data_type=data_type,
         combine_mode=combine_mode,
+        **transport.kwargs(),
     )
+    per_rank_vmm = _cco_per_rank_vmm(
+        ep_size, hidden_dim, cfg.max_num_inp_token_per_rank, data_type.itemsize
+    )
+    if cfg.is_internode:
+        # Include staging, routing and signals from MorI's actual arena layout.
+        from mori.ops.dispatch_combine_v2.internode_regions import internode_regions
+
+        arena_bytes = 0
+        for _, nbytes in internode_regions(cfg):
+            arena_bytes = (arena_bytes + 255) // 256 * 256 + nbytes
+        arena_bytes = (arena_bytes + 255) // 256 * 256
+        per_rank_vmm = max(per_rank_vmm, 2 * arena_bytes + (1 << 28))
+    comm = _init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm)
     op = EpDispatchCombineOp(cfg, comm)
     comm.barrier()
     logger.info(
         "[MORI-V2] Created dispatch_combine_v2 op: ep_rank=%d ep_size=%d "
-        "hidden=%d num_local_experts=%d topk=%d M=%d combine=%s",
+        "hidden=%d num_local_experts=%d topk=%d M=%d combine=%s transport=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -370,6 +368,7 @@ def init_mori_v2_op(
         num_experts_per_token,
         max_num_inp_token_per_rank,
         combine_mode,
+        transport,
     )
     return op
 
@@ -383,6 +382,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         mega_geometry: dict | None = None,
+        transport: MoriV2TransportConfig | None = None,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -399,6 +399,35 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self._mega_geometry = mega_geometry
         self.mega: Any = None
         self.is_fused = mega_geometry is not None
+        self._transport = transport
+
+    def _select_internode_family(self) -> None:
+        transport = self._transport
+        if (
+            transport is None
+            or transport.gpu_per_node == self.num_dispatchers_
+            or transport.internode_kernel != "auto"
+        ):
+            return
+        forward = get_forward_context()
+        context = forward.context
+        metadata = getattr(forward, "dp_metadata", None)
+        max_tokens = None
+        if metadata is not None:
+            max_tokens = metadata.max_tokens_across_dp
+        elif context is not None and getattr(
+            context, "running_tokens_are_unified", not context.is_prefill
+        ):
+            max_tokens = context.running_tokens
+        tp_size = 1
+        if get_current_atom_config().moe_ep_flatten_tp_across_dp:
+            tp_size = get_tp_group().world_size
+        # MorI auto compiled both families at construction. Its launch wrapper
+        # reads cfg.internode_kernel on each call; fix that choice for this pair
+        # using the CPU bound shared across DP ranks. Local input.shape[0] can
+        # straddle the cutoff during mixed prefill/decode and is not collective.
+        # Captured graphs retain the selected launch; no host/device sync occurs.
+        self._op.cfg.internode_kernel = transport.family_for_batch(max_tokens, tp_size)
 
     def bind_mega_transport(self, layer: torch.nn.Module, quant_method: Any) -> None:
         """Build the shared MegaMoE once the layer reveals the model-wide recipe.
@@ -473,6 +502,8 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             self.mega is None
         ), "the fused transport runs the layer in MoriV2ModularKernel.forward()"
 
+        self._select_internode_family()
+
         # bf16 dispatch, no wire quant: scales=None. indices carry global expert
         # ids (0..global_num_experts-1); mori routes id -> rank = id // EPR.
         recv_x, recv_w, _recv_s, recv_idx, _total_recv_t, routing = self._op.dispatch(
@@ -529,15 +560,9 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
     so forward() hands it this layer's weights and returns its output instead of
     walking prepare -> fused_moe -> finalize.
 
-    Both transports get the same grid shrink. The dispatch arena is padded to a
-    huge static token_num (ws * max_num_inp_token_per_rank) while the received
-    tokens occupy only the first ``total_recv`` rows, so under a uniform
-    all-ranks-decode batch it is capped at the static ``running_tokens*topk*dp``
-    bound (the V1/base policy): the grid-bound aiter kernels (route-ksplit
-    preshuffle, gather-reduce) then launch a grid sized to the decode bucket
-    instead of the full arena, and the single-block route/psum kernels shrink too.
-    Gather slices the buffers here; the fused path passes the bound down as
-    ``recv_token_bound`` because it never sees them.
+    The gather path inherits native receive bounds from the base class, including
+    TP sender padding and mixed-DPA metadata. The local fused MegaMoE path keeps
+    its separate conservative decode bound and passes it as recv_token_bound.
     """
 
     def _decode_recv_bound(self, topk_ids: torch.Tensor, arena_rows: int) -> int | None:
@@ -576,14 +601,16 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         topk_ids: torch.Tensor,
         expert_tokens_meta,
     ):
-        bound = self._decode_recv_bound(topk_ids, dispatch_a1.shape[0])
-        if bound is not None:
-            dispatch_a1 = dispatch_a1[:bound]
-            dispatch_ids = dispatch_ids[:bound]
-            dispatch_weights = dispatch_weights[:bound]
-            if dispatch_scale is not None:
-                dispatch_scale = dispatch_scale[:bound]
-        return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+        # Share native TP sender-padding and mixed-DPA bounds. EPv2 also
+        # deduplicates per destination rank, so topk must not inflate this bound.
+        return super()._maybe_trim_dispatch_output(
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            topk_ids,
+            expert_tokens_meta,
+        )
 
     def forward(
         self,
@@ -670,6 +697,13 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
     ep_src_global_rank = ep_group.ranks[0]
     ep_size = all2all_manager.world_size
 
+    transport = MoriV2TransportConfig.from_topology(
+        world_size=ep_size,
+        local_ep_size=moe.moe_parallel_config.local_ep_size,
+        internode=all2all_manager.internode,
+        fused=_resolve_transport() == "mega",
+    )
+
     if _resolve_transport() == "mega":
         # Geometry only; the expert-GEMM recipe comes from the layer later.
         return MoriV2PrepareAndFinalize(
@@ -696,11 +730,13 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
         max_num_inp_token_per_rank=moe.max_num_tokens,
         num_local_experts=moe.num_experts // ep_size,
         num_experts_per_token=moe.experts_per_token,
-        data_type_itemsize=moe.in_dtype.itemsize,
+        data_type=moe.in_dtype,
+        transport=transport,
         combine_mode="gather",
     )
     return MoriV2PrepareAndFinalize(
         op,
         max_tokens_per_rank=moe.max_num_tokens,
         num_dispatchers=ep_size,
+        transport=transport,
     )

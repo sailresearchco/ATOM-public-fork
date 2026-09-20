@@ -643,8 +643,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         if moe.use_mori_kernels:
             from atom.utils import envs as _atom_envs
 
-            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
-            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
+            # EPv2 selects HIP/GDA for physical internode groups and preserves
+            # the local FlyDSL/HIP choice for a single-node group.
             if _atom_envs.ATOM_MORI_V2:
                 from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
                     make_mori_v2_prepare_finalize,

@@ -80,11 +80,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the locally owned experts, then reduce-scatters the outputs.
     "ATOM_DISABLE_MORI_EP": lambda: os.getenv("ATOM_DISABLE_MORI_EP", "0").lower()
     in {"1", "true", "yes", "on"},
-    # Use mori dispatch_combine_v2 (FlyDSL/cco, gfx1250 wave32) instead of the
-    # production mori v1 (mori.ops.EpDispatchCombineOp) for the EP+DP MoE
-    # all2all. v1 is authored for gfx942/950 and does not run on gfx1250; v2 is
-    # the gfx1250-capable path. Only takes effect when the mori all2all path is
-    # active (dp_size>1 + expert-parallel + mori installed).
+    # Use MorI EPv2: HIP/CCO for internode, FlyDSL/HIP for intranode.
+    # Takes effect when the MorI all2all path is active.
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
     # gemm2-fused EP combine: the a8w4 grouped gemm2 epilogue P2P-writes its
     # weighted per-(token,k) results straight into the peers' combine staging, so
