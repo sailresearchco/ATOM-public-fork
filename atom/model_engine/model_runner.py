@@ -724,7 +724,9 @@ class ModelRunner:
 
         # Install external observation hooks in every worker before compilation
         # or graph capture. Disabled mode does not import Spyglass.
-        if os.environ.get("SPYGLASS_CAPTURE") == "1" or os.environ.get("SPYGLASS_PERF_HOOKS"):
+        if os.environ.get("SPYGLASS_CAPTURE") == "1" or os.environ.get(
+            "SPYGLASS_PERF_HOOKS"
+        ):
             from spyglass.atom import register as register_spyglass
 
             register_spyglass(self)
@@ -1096,6 +1098,7 @@ class ModelRunner:
             return {"trace_dir": self.profiler_dir, "elapsed": 0.0}
         t0 = time.monotonic()
         logger.info("Rank %d: stopping profiler...", self.rank)
+        probe_report = None
         try:
             self.profiler.__exit__(None, None, None)
         except Exception:
@@ -1105,14 +1108,32 @@ class ModelRunner:
             if os.environ.get("SPYGLASS_PERF_HOOKS"):
                 from spyglass.atom import stop_probes
 
-                stop_probes()
+                probe_report = stop_probes()
         elapsed = round(time.monotonic() - t0, 1)
         logger.info(
             "Rank %d: profiler stop completed in %.1fs",
             self.rank,
             elapsed,
         )
-        return {"trace_dir": self.profiler_dir, "elapsed": elapsed}
+        return {
+            "trace_dir": self.profiler_dir,
+            "elapsed": elapsed,
+            "spyglass": (
+                {
+                    key: probe_report.get(key)
+                    for key in (
+                        "capture",
+                        "path",
+                        "status",
+                        "dropped",
+                        "metadata_errors",
+                        "inflight",
+                    )
+                }
+                if probe_report is not None
+                else None
+            ),
+        }
 
     def debug(self, *args: Any):
         if self.rank == 0:
