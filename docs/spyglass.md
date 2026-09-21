@@ -26,3 +26,13 @@ does not prove execution. Compiled/opaque callables may need a different externa
 target. Async callback scopes mark host execution, not device completion.
 Instrumented timing cannot establish an unprofiled speedup. These changes do not
 supply replay/reset, numerical references, or production-wide validation.
+
+The programmable lifecycle API requires Spyglass commit `ea8a8f3` or newer from
+`sailresearchco/spyglass` (`codex/atom-programmable-probes`). Install that revision
+in every worker image before enabling the hook config. No Spyglass dependency is
+required with capture/performance hooks disabled.
+
+Upstream maintenance: this integration is independent of K3 serving changes.
+Keep `upstream` pointing at `ROCm/ATOM`; merge upstream updates into fork `main`
+and preserve this small optional integration. Do not merge the entire serving
+branch merely to carry probes forward.
